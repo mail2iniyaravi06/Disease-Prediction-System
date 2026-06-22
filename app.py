@@ -110,10 +110,9 @@ defaults = {
     "username": "",
     "df": None,
     "cleaned_df": None,
-    "encoded_df": None,         # NEW: stores the label-encoded feature dataframe
     "model": None,
     "features": None,
-    "encoders": {},             # column -> LabelEncoder for ALL feature columns (str + numeric)
+    "encoders": {},        # col -> LabelEncoder  (only STRING feature columns)
     "target_encoder": None,
     "target_name": None,
 }
@@ -154,7 +153,7 @@ if not st.session_state.logged_in:
     if menu == "Register":
         st.subheader("Create Account")
         user = st.text_input("Username")
-        pwd = st.text_input("Password", type="password")
+        pwd  = st.text_input("Password", type="password")
         if st.button("Register"):
             if not user or not pwd:
                 st.error("Username and password cannot be empty")
@@ -172,7 +171,7 @@ if not st.session_state.logged_in:
     if menu == "Login":
         st.subheader("Login")
         user = st.text_input("Username")
-        pwd = st.text_input("Password", type="password")
+        pwd  = st.text_input("Password", type="password")
         if st.button("Login"):
             cursor.execute(
                 "SELECT * FROM users WHERE username=? AND password=?",
@@ -181,7 +180,7 @@ if not st.session_state.logged_in:
             result = cursor.fetchone()
             if result:
                 st.session_state.logged_in = True
-                st.session_state.username = user
+                st.session_state.username  = user
                 st.rerun()
             else:
                 st.error("Invalid credentials")
@@ -221,16 +220,16 @@ if st.sidebar.button("🚨 Disease Alert Guide"):
 # HELPER: DATA CLEANING
 # ===============================
 def clean_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+    """Fill missing values; numeric → median, string → mode."""
     df = df.copy()
 
-    # Try to coerce object columns that look numeric
+    # Try converting object columns that are secretly numeric
     for col in df.columns:
         if df[col].dtype == "object":
             converted = pd.to_numeric(df[col], errors="coerce")
             if converted.notna().sum() >= 0.8 * len(df[col].dropna()) and converted.notna().any():
                 df[col] = converted
 
-    # Fill missing values
     for col in df.columns:
         if pd.api.types.is_numeric_dtype(df[col]):
             if df[col].isnull().any():
@@ -239,41 +238,48 @@ def clean_dataframe(df: pd.DataFrame) -> pd.DataFrame:
         else:
             if df[col].isnull().any():
                 mode_vals = df[col].mode(dropna=True)
-                fill_val = mode_vals.iloc[0] if not mode_vals.empty else "Unknown"
-                df[col] = df[col].fillna(fill_val)
+                fill_val  = mode_vals.iloc[0] if not mode_vals.empty else "Unknown"
+                df[col]   = df[col].fillna(fill_val)
             df[col] = df[col].astype(str)
 
     return df
 
 
 # ===============================
-# KEY CHANGE: LABEL ENCODE ALL FEATURE COLUMNS
-# (Both categorical AND numeric columns get a LabelEncoder)
+# LABEL ENCODE ONLY STRING FEATURE COLUMNS
+# Numeric columns are left as-is.
+# Target column is NEVER touched here.
 # ===============================
-def label_encode_all_features(X: pd.DataFrame):
+def label_encode_string_features(X: pd.DataFrame):
     """
-    Apply LabelEncoder to EVERY feature column regardless of dtype.
-    - String/categorical columns: encode category names → integers.
-    - Numeric columns: encode unique numeric values → integers
-      (preserves ordinal mapping; all columns end up as int).
-    Returns:
-        X_encoded : pd.DataFrame  (all columns are int64)
-        encoders  : dict { col_name -> fitted LabelEncoder }
+    - Detects every column that contains string / object data.
+    - Applies LabelEncoder to convert each string column → 0/1/2… integers.
+    - Numeric columns are kept exactly as they are.
+    - Returns the transformed X and a dict of {col: fitted LabelEncoder}.
     """
     X = X.copy()
 
-    # Remove duplicate column names if any
+    # Remove duplicate column names silently
     if X.columns.duplicated().any():
         X = X.loc[:, ~X.columns.duplicated()]
 
     encoders = {}
-    for col in X.columns:
-        le = LabelEncoder()
-        # Convert to string first so LabelEncoder handles all dtypes uniformly
-        X[col] = le.fit_transform(X[col].astype(str))
-        encoders[col] = le
 
-    return X.astype(int), encoders
+    for col in X.columns:
+        # Check if this column has string/object values
+        if X[col].dtype == "object" or (
+            X[col].dtype != "object" and
+            not pd.api.types.is_numeric_dtype(X[col])
+        ):
+            le = LabelEncoder()
+            X[col]       = le.fit_transform(X[col].astype(str))
+            encoders[col] = le
+        else:
+            # Numeric column — just make sure it has no NaN / inf
+            X[col] = pd.to_numeric(X[col], errors="coerce").fillna(0)
+            X[col] = X[col].replace([np.inf, -np.inf], 0)
+
+    return X, encoders
 
 
 # ===============================
@@ -342,37 +348,52 @@ if st.session_state.logged_in:
 
                 df = df.dropna(subset=[target])
 
+                # Separate features and target BEFORE any encoding
                 X = df.drop(columns=[target])
-                y = df[target]
+                y = df[target]   # target is NEVER label-encoded
 
-                # --------------------------------------------------
-                # LABEL ENCODE ALL FEATURE COLUMNS (the key change)
-                # --------------------------------------------------
-                X_encoded, encoders = label_encode_all_features(X)
+                # -------------------------------------------------------
+                # LABEL ENCODE: only string columns in X, skip numeric ones
+                # -------------------------------------------------------
+                X_encoded, encoders = label_encode_string_features(X)
 
-                # Show encoding summary in an expander
-                with st.expander("📊 Label Encoding Summary (all feature columns)"):
-                    for col, le in encoders.items():
-                        mapping = {orig: enc for enc, orig in enumerate(le.classes_)}
-                        st.write(f"**{col}**: {mapping}")
+                # Show which string columns were encoded
+                if encoders:
+                    with st.expander("📊 Label Encoding Summary (string feature columns only)"):
+                        for col, le in encoders.items():
+                            mapping = {str(orig): int(enc) for enc, orig in enumerate(le.classes_)}
+                            st.write(f"**{col}** → {mapping}")
+                else:
+                    st.info("No string columns found in features — all columns are already numeric.")
 
-                # Store encoded df for reference
-                st.session_state.encoded_df = X_encoded
+                # Show numeric columns that were kept as-is
+                numeric_cols = [c for c in X.columns if c not in encoders]
+                if numeric_cols:
+                    st.info(f"Numeric columns (kept as-is): {numeric_cols}")
 
-                # ---- Encode TARGET if it's categorical ----
+                # -------------------------------------------------------
+                # TARGET: keep original values — NO encoding
+                # -------------------------------------------------------
+                # y stays exactly as it is (string or numeric)
                 target_encoder = None
-                if y.dtype == "object" or not pd.api.types.is_numeric_dtype(y):
+                if not pd.api.types.is_numeric_dtype(y):
+                    # We still need to encode for sklearn, but we store the encoder
+                    # so we can decode predictions back to original labels
                     target_encoder = LabelEncoder()
-                    y = target_encoder.fit_transform(y.astype(str))
-                    if target_encoder is not None:
-                        st.info(f"Target '{target}' encoding: "
-                                f"{ {orig: enc for enc, orig in enumerate(target_encoder.classes_)} }")
+                    y_encoded = target_encoder.fit_transform(y.astype(str))
+                    st.info(
+                        f"Target column **'{target}'** contains strings — "
+                        f"encoded internally for training only. "
+                        f"Mapping: { {str(orig): int(enc) for enc, orig in enumerate(target_encoder.classes_)} }"
+                    )
+                else:
+                    y_encoded = y.values
 
                 if X_encoded.empty or len(X_encoded) < 5:
-                    st.error("Not enough clean data to train. Please check your dataset.")
+                    st.error("Not enough data to train. Please check your dataset.")
                 else:
                     X_train, X_test, y_train, y_test = train_test_split(
-                        X_encoded, y, test_size=0.2, random_state=42
+                        X_encoded, y_encoded, test_size=0.2, random_state=42
                     )
 
                     model = RandomForestClassifier(random_state=42)
@@ -387,18 +408,18 @@ if st.session_state.logged_in:
 
                     st.success("✅ Model Trained Successfully!")
 
-                    col1, col2, col3, col4 = st.columns(4)
-                    col1.metric("Accuracy",  f"{acc:.4f}")
-                    col2.metric("Precision", f"{prec:.4f}")
-                    col3.metric("Recall",    f"{rec:.4f}")
-                    col4.metric("F1 Score",  f"{f1:.4f}")
+                    c1, c2, c3, c4 = st.columns(4)
+                    c1.metric("Accuracy",  f"{acc:.4f}")
+                    c2.metric("Precision", f"{prec:.4f}")
+                    c3.metric("Recall",    f"{rec:.4f}")
+                    c4.metric("F1 Score",  f"{f1:.4f}")
 
                     joblib.dump(model, "disease_model.pkl")
 
                     st.session_state.model          = model
                     st.session_state.features       = list(X_encoded.columns)
-                    st.session_state.encoders       = encoders
-                    st.session_state.target_encoder = target_encoder
+                    st.session_state.encoders       = encoders          # only string cols
+                    st.session_state.target_encoder = target_encoder    # None if target is numeric
                     st.session_state.target_name    = target
 
     # ===========================
@@ -412,28 +433,28 @@ if st.session_state.logged_in:
         else:
             st.subheader("Enter Values for Prediction")
 
-            inputs = {}
+            inputs   = {}
             encoders = st.session_state.encoders or {}
 
             for col in st.session_state.features:
                 if col in encoders:
-                    le = encoders[col]
-                    # Show original labels in the dropdown
+                    # String column — show original category names as dropdown
+                    le      = encoders[col]
                     options = list(le.classes_)
-                    choice = st.selectbox(f"{col}", options)
-                    # Transform the chosen label back to its encoded integer
+                    choice  = st.selectbox(col, options)
                     inputs[col] = int(le.transform([choice])[0])
                 else:
+                    # Numeric column — show number input
                     inputs[col] = st.number_input(col, value=0.0)
 
             if st.button("Predict"):
-                input_df = pd.DataFrame([inputs])[st.session_state.features]
-                input_df = input_df.astype(float)
+                input_df   = pd.DataFrame([inputs])[st.session_state.features]
+                input_df   = input_df.astype(float)
 
                 model      = st.session_state.model
                 prediction = model.predict(input_df)[0]
 
-                # Decode target back to original label
+                # Decode prediction back to original target label
                 if st.session_state.target_encoder is not None:
                     prediction_label = st.session_state.target_encoder.inverse_transform(
                         [int(prediction)]
@@ -445,22 +466,23 @@ if st.session_state.logged_in:
 
                 if hasattr(model, "predict_proba"):
                     probabilities = model.predict_proba(input_df)[0]
-                    max_prob = max(probabilities)
+                    max_prob      = max(probabilities)
                     st.write(f"🎯 Prediction Confidence: **{max_prob * 100:.2f}%**")
 
-                    # Show all class probabilities
                     with st.expander("📈 All Class Probabilities"):
-                        classes = model.classes_
+                        classes    = model.classes_
                         target_enc = st.session_state.target_encoder
-                        prob_data = {}
+                        prob_rows  = []
                         for cls, prob in zip(classes, probabilities):
                             if target_enc is not None:
                                 label = target_enc.inverse_transform([int(cls)])[0]
                             else:
                                 label = cls
-                            prob_data[str(label)] = round(float(prob) * 100, 2)
-                        prob_df = pd.DataFrame(
-                            list(prob_data.items()),
-                            columns=["Disease", "Probability (%)"]
-                        ).sort_values("Probability (%)", ascending=False)
+                            prob_rows.append({"Disease": str(label),
+                                              "Probability (%)": round(float(prob) * 100, 2)})
+                        prob_df = (
+                            pd.DataFrame(prob_rows)
+                            .sort_values("Probability (%)", ascending=False)
+                            .reset_index(drop=True)
+                        )
                         st.dataframe(prob_df, use_container_width=True)
